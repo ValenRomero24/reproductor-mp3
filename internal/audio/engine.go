@@ -1,0 +1,209 @@
+package audio
+
+import (
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+
+
+	"github.com/ValenRomero24/reproductor-mp3/internal/domain"
+	"github.com/ebitengine/oto/v3"
+	"github.com/hajimehoshi/go-mp3"
+	"github.com/mewkiz/flac"
+	"github.com/youpy/go-wav"	
+)
+
+// OtoEngine implementa la interfaz domain.AudioEngine usando Ebitengine/Oto
+type OtoEngine struct {
+	context			*oto.Context
+	sampleRate 		int
+	currentFormat	oto.Format //Guardar formato correspondiente 
+	player			*oto.Player
+	pcmStream		io.Reader // <---INTERFAZ GENÉRICA: Soporta MP3, FLAC o WAV
+	currentFile		*os.File
+
+	mu				sync.Mutex // Protege el estado interno contra accesos simultaneos
+	state 			domain.PlaybackState
+}
+
+//Constructor limpio del motor, el contexto se crea al usar Play()
+func NewOtoEngine() (*OtoEngine, error){
+	return &OtoEngine{
+		state: domain.StateStopped,
+	}, nil
+}
+
+// Play detiene cualquier reproduccion previa, abre el archivo MP3, lo decodifica y comienza el audio.
+func (e *OtoEngine) Play(path string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+// 1) Limpieza de recursos previos
+	if e.currentFile != nil {
+		e.currentFile.Close()
+		e.currentFile = nil
+	}
+	e.player = nil //liberamos el player anterior
+	e.pcmStream = nil //liberamos el decoder anterior
+
+// 2) Abrir el archivo fisico
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	e.currentFile = file
+
+	var fileSampleRate int
+	fileFormat:= oto.FormatSignedInt16LE
+
+	ext := strings.ToLower(filepath.Ext(path))
+
+// 3) Switch polimórfico: cada formato se decodifica a PCM crudo
+	switch ext {
+	case ".mp3":
+		dec, err:=mp3.NewDecoder(file)
+		if err != nil{
+			file.Close()
+			return err
+		}
+		fileSampleRate = dec.SampleRate()
+		e.pcmStream = dec
+	case ".wav":
+		dec := wav.NewReader(file)
+		format, err := dec.Format()
+		if err != nil{
+			file.Close()
+			return err
+		}
+		fileSampleRate = int(format.SampleRate)
+		e.pcmStream = dec
+	case ".flac":
+		dec, err := flac.New(file)
+		if err != nil{
+			file.Close()
+			return err
+		}
+		fileSampleRate = int(dec.Info.SampleRate)
+
+		e.pcmStream = &flacDecoderWrapper{
+			stream: dec,
+			bps: int(dec.Info.BitsPerSample),
+		}
+
+	default:
+		file.Close()
+		return fmt.Errorf("Formato de archivo no soportado: $s", ext)
+	}
+
+// 4) Control dinámico de Hardware (sample rate & formato)
+	if e.context == nil || e.sampleRate != fileSampleRate || e.currentFormat != fileFormat{
+		options := &oto.NewContextOptions{
+			SampleRate:		fileSampleRate,
+			ChannelCount: 	2,
+			Format: 		fileFormat,
+		}
+
+		ctx, readyChan, err := oto.NewContext(options)
+		if err != nil {
+			file.Close()
+			return fmt.Errorf("Error al inicializar hardware para: %s: %v", ext, err)
+		}
+		<-readyChan
+
+		e.context 		= ctx
+		e.sampleRate 	= fileSampleRate
+		e.currentFormat	= fileFormat
+	}
+// 5) Iniciar la reproducción usando la interfaz genérica
+	e.player = e.context.NewPlayer(e.pcmStream)
+	e.player.Play()
+	e.state = domain.StatePlaying
+
+	return nil
+}
+
+func (e *OtoEngine) Pause(){
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.player != nil && e.state == domain.StatePlaying{
+		e.player.Pause()
+		e.state = domain.StatePaused
+	}
+}
+
+func (e *OtoEngine) Resume(){
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.player != nil && e.state == domain.StatePaused {
+		e.player.Play() // Reaunda si ya fue inicializado oto.
+		e.state = domain.StatePlaying
+	}
+}
+
+func (e *OtoEngine) Stop(){
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.player != nil{
+		e.player.Pause()
+		e.state = domain.StateStopped
+	}
+}
+
+// Adaptador: Transforma frame de FLAC en un flujo io.Reader PCM
+
+type flacDecoderWrapper struct{
+	stream	*flac.Stream
+	buf		[]byte
+	off		int
+	bps		int
+}
+
+func (w *flacDecoderWrapper) Read(p []byte) (int, error){
+//Si ya se consumió buffer interno trae el siguiente frame
+	if w.off >= len(w.buf){
+		frame, err := w.stream.ParseNext()
+		if err != nil {
+			return 0, err
+		}
+
+		numChannels := len(frame.Subframes)
+		if numChannels == 0{
+			return 0, io.EOF
+		}
+		numSamples := len(frame.Subframes[0].Samples)
+
+		w.buf = make([]byte, numSamples*numChannels*2)
+		idx :=0
+	//Interpolar los canales (L R L R L R) y converir a Little Endian
+		for i:=0; i < numSamples; i++{
+			for ch:=0; ch < numChannels; ch++ {
+				sample := frame.Subframes[ch].Samples[i]
+
+				var s16 int16
+				if w.bps == 24{
+					s16 = int16(sample >> 8) //DownSamplig seguro de 24-bit a 16.bit
+				} else if w.bps == 32{
+					s16 = int16(sample >> 16)
+				} else {
+					s16 = int16(sample) //16-bit nativo
+				}
+
+			//Escribir los bytes en formato Little Endian
+				w.buf[idx] = byte(s16)
+				w.buf[idx+1] = byte(s16 >> 8)
+				idx += 2
+			}
+		}
+		w.off = 0
+	}
+
+	n:= copy(p, w.buf[w.off:])
+	w.off += n
+	return n, nil
+}
