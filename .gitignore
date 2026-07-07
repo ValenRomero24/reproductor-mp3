@@ -1,0 +1,15 @@
+# Ejecutables binarios compilados
+reproductor-mp3
+dist/
+bin/
+
+# Archivos de música locales (¡No queremos subir gigas de FLACs!)
+*.mp3
+*.flac
+*.wav
+
+# Carpetas de configuración de editores
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
