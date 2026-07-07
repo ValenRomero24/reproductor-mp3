@@ -66,11 +66,11 @@ func main(){
 	defer term.Restore(int(os.Stdin.Fd()), oldState)
 
 	fmt.Print("\r\n=== CONTROLES EN TIEMPO REAL ===\r\n")
-	fmt.Print("[Espacio]: Pausa/Play | [n]: Siguiente | [p]: Anterior | [q]: Salir\r\n")
+	fmt.Print("[Espacio]: Pausa/Play | [n]: Sig | [p]: Ant | [+ / -]: volumen | [q]: Salir\r\n")
 	fmt.Print("================================\r\n\r\n")
 
 	//Imprimir estado inicial
-	printHUD(currentTrack.Title, false)
+	printHUD(currentTrack.Title, false, engine.Volume())
 
 // Lógica Asincrónica de Entrada
 	keyChan := make(chan byte)
@@ -88,8 +88,10 @@ func main(){
 	paused := false
 	running := true
 
+// BUcle de control basasdo en eventos
 	for running {
 		select{
+	// Evento A) El usuario tocó el teclado
 		case char := <-keyChan:
 			if char == 'q' || char == 'Q' || char== 3{
 				running = false
@@ -104,26 +106,36 @@ func main(){
 					engine.Pause()
 					paused = true
 				}
-				printHUD(currentTrack.Title, paused)
+				printHUD(currentTrack.Title, paused, engine.Volume())
 			case 'n', 'N':
 				manager.Next()
 				currentTrack, _=manager.CurrentTrack()
 				_ = engine.Play(currentTrack.Path)
 				paused = false
-				printHUD(currentTrack.Title, paused)
+				printHUD(currentTrack.Title, paused, engine.Volume())
 			case 'p', 'P':
 				manager.Prev()
 				currentTrack,_ = manager.CurrentTrack()
 				_ = engine.Play(currentTrack.Path)
 				paused  = false
-				printHUD(currentTrack.Title, paused)
+				printHUD(currentTrack.Title, paused, engine.Volume())
+			case '+', '=':
+				nuevoVol := engine.Volume() + 0.05 // Sube de a 5%
+				engine.SetVolume(nuevoVol)
+				printHUD(currentTrack.Title, paused, engine.Volume())
+			case '-':
+				nuevoVol := engine.Volume() -0.05 // Baja de a 5%
+				engine.SetVolume(nuevoVol)
+				printHUD(currentTrack.Title, paused, engine.Volume())
 			}
+	// Evento B) El motor avisa que la canción actual terminó sola
 		case <-engine.Done():
+		// Avanzar a la siguiente de forma automática
 			manager.Next()
 			currentTrack, _ = manager.CurrentTrack()
 			_ = engine.Play(currentTrack.Path)
 			paused = false
-			printHUD(currentTrack.Title, paused)
+			printHUD(currentTrack.Title, paused, engine.Volume())
 		}
 	}
 
@@ -133,12 +145,11 @@ func main(){
 	runtime.KeepAlive(manager)
 }
 
-func printHUD(title string, paused bool){
+func printHUD(title string, paused bool, volume float64){
 	status:= "▶️  Reproduciendo"
 	if paused {
 		status = "⏸️  Pausado"
 	}
-	// \r devuelveel cursor al inicio de la linea
-	// \x1b[K...] es un codigo ANSI que borra todo lo que había antes en esa linea.
-	fmt.Printf("\r\x1b[K%s: %s", status, title)
+	volPorcentaje := int(volume * 100)
+	fmt.Printf("\r\x1b[K%s: %s [Vol: %d%%]", status, title, volPorcentaje)
 }

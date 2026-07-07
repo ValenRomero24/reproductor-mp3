@@ -28,32 +28,21 @@ type OtoEngine struct {
 
 	mu				sync.Mutex // Protege el estado interno contra accesos simultaneos
 	state 			domain.PlaybackState
-}
 
-// Adaptador: Transforma frame de FLAC en un flujo io.Reader PCM
-
-type flacDecoderWrapper struct{
-	stream	*flac.Stream
-	buf		[]byte
-	off		int
-	bps		int
-}
-
-type eofNotifierReader struct{
-	source	io.Reader
-	done 	chan struct{}
-	sent 	bool
+	volume float64		// control de volumen (Min: 0.0 - Max: 1.0)
+	volMu sync.RWMutex // Mutex dedicado 
 }
 
 // Constructor limpio del motor, el contexto se crea al usar Play()
 func NewOtoEngine() (*OtoEngine, error){
 	return &OtoEngine{
-		state: domain.StateStopped,
-		doneChan: make(chan struct{},1), // Canal buffereado
+		state:		domain.StateStopped,
+		doneChan:	make(chan struct{},1), // Canal buffereado
+		volume:		1.0,
 	}, nil
 }
 
-// Expone el canal de lectura para cualquierue el main sepa cúando termina una canción
+// Expone el canal de lectura para que el main sepa cúando termina una canción
 func(e *OtoEngine) Done() <-chan struct{}{
 	return e.doneChan
 }
@@ -126,12 +115,16 @@ func (e *OtoEngine) Play(path string) error {
 		return fmt.Errorf("Formato de archivo no soportado: %s", ext)
 	}
 
-// Decorador: envuelve el stream final para capturar el fin de la cancion
+// 1) Primer decorador: Detecta el fin de la cancion
 	e.pcmStream = &eofNotifierReader{
 		source: e.pcmStream,
 		done: 	e.doneChan,
 	}
-
+// 2) Segundo decorador: Modifica el volumen de los bytes resultantes
+	e.pcmStream = &volumeReader{
+		source: e.pcmStream,
+		engine: e,
+	}
 
 // 4) Control dinámico de Hardware (sample rate & formato)
 	if e.context == nil || e.sampleRate != fileSampleRate || e.currentFormat != fileFormat{
@@ -191,8 +184,30 @@ func (e *OtoEngine) Stop(){
 	}
 }
 
+func (e *OtoEngine) SetVolume(vol float64){
+	e.volMu.Lock()
+	defer e.volMu.Unlock()
+	if vol < 0.0 { vol = 0.0}
+	if vol > 1.0 { vol = 1.0}
+	e.volume = vol
+}
+
+func (e *OtoEngine) Volume() float64{
+	e.volMu.RLock()
+	defer e.volMu.RUnlock()
+	return e.volume
+}
+
+// flacDecoderWrapper: Transforma frame de FLAC en un flujo io.Reader PCM
+type flacDecoderWrapper struct{
+	stream	*flac.Stream
+	buf		[]byte
+	off		int
+	bps		int
+}
+
 func (w *flacDecoderWrapper) Read(p []byte) (int, error){
-//Si ya se consumió buffer interno trae el siguiente frame
+	//Si ya se consumió buffer interno trae el siguiente frame
 	if w.off >= len(w.buf){
 		frame, err := w.stream.ParseNext()
 		if err != nil {
@@ -235,6 +250,13 @@ func (w *flacDecoderWrapper) Read(p []byte) (int, error){
 	return n, nil
 }
 
+// eofNotifierReader: Monitorea el flujo y gatilla el fin de la canción
+type eofNotifierReader struct{
+	source	io.Reader
+	done 	chan struct{}
+	sent 	bool
+}
+
 func(r *eofNotifierReader) Read(p []byte) (int, error){
 	n, err := r.source.Read(p)
 
@@ -243,9 +265,41 @@ func(r *eofNotifierReader) Read(p []byte) (int, error){
 		r.sent = true
 
 		go func(){
-			time.Sleep(600 * time.Millisecond)
+			time.Sleep(100 * time.Millisecond)
 			r.done <- struct{}{}
 		}()
+	}
+	return n, err
+}
+
+// volumeReader: Modifica la amplitud matemática de los bytes PCM
+type volumeReader struct{
+	source	io.Reader
+	engine	*OtoEngine
+}
+
+func (v *volumeReader) Read(p []byte) (int, error){
+	n, err := v.source.Read(p)
+	if n > 0 {
+		vol := v.engine.Volume()
+	// Si el volumen está al maximo (1.0), saltea el cálculo para ahorrar CPU
+		if vol < 0.99{
+		// Avanzar de a 2 Bytes (cada muestra = int16)
+			for i:=0; i < n; i+=2{
+				if i+1 >= n{
+					break // Proteccion por si llega un byte al final del buffer
+				}
+			// 1) Reconstrucción del int16 a partir de 2 bytes (Little Endian)
+				sample := int16(p[i]) | (int16(p[i+1]) << 8)
+			
+			// 2) Aplicar ganancia (atenuación)
+				newSample := int16(float64(sample) * vol)
+			
+			// 3) Separacion del int16 a 2 bytes individuales
+				p[i]	= byte(newSample)
+				p[i+1]	= byte(newSample >> 8)
+			}
+		}
 	}
 	return n, err
 }
