@@ -21,7 +21,7 @@ func main(){
 	dirPath := os.Args[1]
 
 // 2) Escaneo del directorio POSIX
-	fmt.Println("Escaneando la carpeta: %s\n", dirPath)
+	fmt.Printf("Escaneando la carpeta: %s\n", dirPath)
 	tracks, err := audio.ScanDirectory(dirPath)
 	if err != nil {
 		log.Fatalf("Error al escanear el directorio: %v", err)
@@ -29,7 +29,7 @@ func main(){
 
 // Defensa: si la carpeta está vacía o no tiene MP3 válidos, corta
 	if len(tracks) == 0{
-		fmt.Println("No se encontraron archivos .mp3 en el directorio especificado.")
+		fmt.Println("No se encontraron archivos .mp3/.FLAC/.WAV en el directorio especificado.")
 		return
 	}
 	fmt.Printf("¡Éxito! Se cargaron %d canciones en la cola.\n", len(tracks))
@@ -48,7 +48,7 @@ func main(){
 // 5) Extraccion del primer Track y Reproducción
 	currentTrack, err := manager.CurrentTrack()
 	if err != nil{
-		log.Fatalf("Error en la playlist: $v", err)
+		log.Fatalf("Error en la playlist: %v", err)
 	}
 	fmt.Printf("\n Reproduciendo [1/%d] %s\n", manager.Count(), currentTrack.Title)	
 	err = engine.Play(currentTrack.Path)
@@ -57,8 +57,7 @@ func main(){
 	}
 
 
-// ACTIVAR MODO RAW (CONSOLA INTERACTIVA)
-//Convertir Stdin en un canal crudo
+// Activación MODO RAW 
 	oldState, err :=term.MakeRaw(int(os.Stdin.Fd()))
 	if err != nil {
 		log.Fatalf("Error al activar modo interactivo: %v", err)
@@ -73,42 +72,54 @@ func main(){
 	//Imprimir estado inicial
 	printHUD(currentTrack.Title, false)
 
-	paused := false
-	buf:= make([]byte, 1)
-
-	for {
-		_,err := os.Stdin.Read(buf)
-		if err != nil{
-			break
-		}
-
-		char := buf[0]
-
-	//Atrapa la 'q', 'Q' o un CTRL+C (ASCII 3) para salir
-		if char == 'q' || char == 'Q' || char == 3{
-			break
-		}
-
-		switch char{
-		case ' ': //Barra espaciadora: Play/Pause
-			if paused {
-				engine.Resume()
-				paused = false
-			} else {
-				engine.Pause()
-				paused = true
+// Lógica Asincrónica de Entrada
+	keyChan := make(chan byte)
+	go func(){
+		buf := make([]byte, 1)
+		for{
+			_, err := os.Stdin.Read(buf)
+			if err != nil {
+				return
 			}
-			printHUD(currentTrack.Title, paused)
-		
-		case 'n', 'N':
-			manager.Next()
-			currentTrack, _ = manager.CurrentTrack()
-			_ = engine.Play(currentTrack.Path)
-			paused = false
-			printHUD(currentTrack.Title, paused)
+			keyChan <- buf[0] //Tecla capturada
+		}
+	}()
 
-		case 'p', 'P':
-			manager.Prev()
+	paused := false
+	running := true
+
+	for running {
+		select{
+		case char := <-keyChan:
+			if char == 'q' || char == 'Q' || char== 3{
+				running = false
+				break
+			}
+			switch char {
+			case ' ':
+				if paused {
+					engine.Resume()
+					paused = false
+				} else {
+					engine.Pause()
+					paused = true
+				}
+				printHUD(currentTrack.Title, paused)
+			case 'n', 'N':
+				manager.Next()
+				currentTrack, _=manager.CurrentTrack()
+				_ = engine.Play(currentTrack.Path)
+				paused = false
+				printHUD(currentTrack.Title, paused)
+			case 'p', 'P':
+				manager.Prev()
+				currentTrack,_ = manager.CurrentTrack()
+				_ = engine.Play(currentTrack.Path)
+				paused  = false
+				printHUD(currentTrack.Title, paused)
+			}
+		case <-engine.Done():
+			manager.Next()
 			currentTrack, _ = manager.CurrentTrack()
 			_ = engine.Play(currentTrack.Path)
 			paused = false

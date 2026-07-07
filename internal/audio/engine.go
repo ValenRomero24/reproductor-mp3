@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-
+	"time"
 
 	"github.com/ValenRomero24/reproductor-mp3/internal/domain"
 	"github.com/ebitengine/oto/v3"
@@ -22,18 +22,40 @@ type OtoEngine struct {
 	sampleRate 		int
 	currentFormat	oto.Format //Guardar formato correspondiente 
 	player			*oto.Player
-	pcmStream		io.Reader // <---INTERFAZ GENÉRICA: Soporta MP3, FLAC o WAV
+	pcmStream		io.Reader // <---Interfaz genérica: Soporta MP3, FLAC o WAV
 	currentFile		*os.File
+	doneChan		chan struct{}//<--- Canal de Eventos
 
 	mu				sync.Mutex // Protege el estado interno contra accesos simultaneos
 	state 			domain.PlaybackState
 }
 
-//Constructor limpio del motor, el contexto se crea al usar Play()
+// Adaptador: Transforma frame de FLAC en un flujo io.Reader PCM
+
+type flacDecoderWrapper struct{
+	stream	*flac.Stream
+	buf		[]byte
+	off		int
+	bps		int
+}
+
+type eofNotifierReader struct{
+	source	io.Reader
+	done 	chan struct{}
+	sent 	bool
+}
+
+// Constructor limpio del motor, el contexto se crea al usar Play()
 func NewOtoEngine() (*OtoEngine, error){
 	return &OtoEngine{
 		state: domain.StateStopped,
+		doneChan: make(chan struct{},1), // Canal buffereado
 	}, nil
+}
+
+// Expone el canal de lectura para cualquierue el main sepa cúando termina una canción
+func(e *OtoEngine) Done() <-chan struct{}{
+	return e.doneChan
 }
 
 // Play detiene cualquier reproduccion previa, abre el archivo MP3, lo decodifica y comienza el audio.
@@ -48,6 +70,12 @@ func (e *OtoEngine) Play(path string) error {
 	}
 	e.player = nil //liberamos el player anterior
 	e.pcmStream = nil //liberamos el decoder anterior
+
+// Limpiar cualquier señal vieja del canal doneChan
+	select{
+	case <-e.doneChan:
+	default:
+	}
 
 // 2) Abrir el archivo fisico
 	file, err := os.Open(path)
@@ -95,8 +123,15 @@ func (e *OtoEngine) Play(path string) error {
 
 	default:
 		file.Close()
-		return fmt.Errorf("Formato de archivo no soportado: $s", ext)
+		return fmt.Errorf("Formato de archivo no soportado: %s", ext)
 	}
+
+// Decorador: envuelve el stream final para capturar el fin de la cancion
+	e.pcmStream = &eofNotifierReader{
+		source: e.pcmStream,
+		done: 	e.doneChan,
+	}
+
 
 // 4) Control dinámico de Hardware (sample rate & formato)
 	if e.context == nil || e.sampleRate != fileSampleRate || e.currentFormat != fileFormat{
@@ -117,6 +152,7 @@ func (e *OtoEngine) Play(path string) error {
 		e.sampleRate 	= fileSampleRate
 		e.currentFormat	= fileFormat
 	}
+
 // 5) Iniciar la reproducción usando la interfaz genérica
 	e.player = e.context.NewPlayer(e.pcmStream)
 	e.player.Play()
@@ -153,15 +189,6 @@ func (e *OtoEngine) Stop(){
 		e.player.Pause()
 		e.state = domain.StateStopped
 	}
-}
-
-// Adaptador: Transforma frame de FLAC en un flujo io.Reader PCM
-
-type flacDecoderWrapper struct{
-	stream	*flac.Stream
-	buf		[]byte
-	off		int
-	bps		int
 }
 
 func (w *flacDecoderWrapper) Read(p []byte) (int, error){
@@ -206,4 +233,19 @@ func (w *flacDecoderWrapper) Read(p []byte) (int, error){
 	n:= copy(p, w.buf[w.off:])
 	w.off += n
 	return n, nil
+}
+
+func(r *eofNotifierReader) Read(p []byte) (int, error){
+	n, err := r.source.Read(p)
+
+	// Si el decoder original se queda sin datos y no se envió el aviso
+	if err == io.EOF && !r.sent {
+		r.sent = true
+
+		go func(){
+			time.Sleep(600 * time.Millisecond)
+			r.done <- struct{}{}
+		}()
+	}
+	return n, err
 }
