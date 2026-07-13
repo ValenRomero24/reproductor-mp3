@@ -10,6 +10,7 @@ import (
 	"github.com/ValenRomero24/reproductor-mp3/internal/audio"
 	"github.com/ValenRomero24/reproductor-mp3/internal/domain"
 	"github.com/ValenRomero24/reproductor-mp3/internal/ui"
+	"github.com/dhowden/tag"
 	"golang.org/x/term"
 )
 
@@ -24,12 +25,18 @@ func main() {
 	if err != nil { log.Fatalf("Error: %v", err) }
 	if len(tracks) == 0 { fmt.Println("No se encontraron canciones."); return }
 
+	enrichMetadata(tracks)
+
 	manager := domain.NewPlaylistManager(tracks)
 	engine, err := audio.NewOtoEngine()
 	if err != nil { log.Fatalf("Error hardware: %v", err) }
 
-	currentTrack, _ := manager.CurrentTrack()
-	_ = engine.Play(currentTrack.Path)
+	currentTrackPtr, ok := playTrackOrSkip(manager, engine)
+	if !ok {
+		fmt.Println("No se pudo reproducir ninguna canción válida en el directorio.")
+		return
+	}
+	currentTrack := *currentTrackPtr
 
 	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
 	if err != nil { log.Fatalf("Error raw terminal: %v", err) }
@@ -93,16 +100,21 @@ func main() {
 			case ' ':
 				if paused { engine.Resume(); paused = false } else { engine.Pause(); paused = true }
 			case 'n', 'N':
-				if manager.Next() {
-					currentTrack, _ = manager.CurrentTrack()
-					_ = engine.Play(currentTrack.Path)
+				manager.Next()
+				if trackPtr, ok := playTrackOrSkip(manager, engine); ok {
+					currentTrack = *trackPtr
 					paused = false
+				} else {
+					running = false
 				}
 			case 'p', 'P':
 				manager.Prev()
-				currentTrack, _ = manager.CurrentTrack()
-				_ = engine.Play(currentTrack.Path)
-				paused = false
+				if trackPtr, ok := playTrackOrSkip(manager, engine); ok {
+					currentTrack = *trackPtr
+					paused = false
+				} else {
+					running = false
+				}
 			case 's', 'S':
 				manager.ToggleShuffle()
 			case 'l', 'L':
@@ -117,11 +129,14 @@ func main() {
 			ui.PrintHUD(currentTrack.Title, paused, shuf, lp, engine.Volume(), pos, tot)
 
 		case <-engine.Done():
-			// Fuego de seguridad si la canción termina por completo
-			if manager.Next() {
-				currentTrack, _ = manager.CurrentTrack()
-				_ = engine.Play(currentTrack.Path)
-				paused = false
+			if manager.Next(){
+				if trackPtr, ok := playTrackOrSkip(manager, engine); ok{
+					currentTrack = *trackPtr
+					paused = false
+				} else {
+					engine.Stop()
+					running = false
+				}
 			} else {
 				engine.Stop()
 				running = false
@@ -133,4 +148,53 @@ func main() {
 	fmt.Println("\n\nPlaylist finalizada de forma limpia.")
 	runtime.KeepAlive(engine)
 	runtime.KeepAlive(manager)
+}
+
+
+func playTrackOrSkip(manager *domain.PlaylistManager, engine *audio.OtoEngine) (*domain.Track, bool){
+	maxIntentos := 5
+	intentos := 0
+
+	for intentos < maxIntentos {
+		track, err := manager.CurrentTrack()
+		if err != nil {
+			 return nil, false
+		}
+		err = engine.Play(track.Path)
+		if err == nil {
+			return &track, true
+		}
+		fmt.Printf("\r\x1b[K⚠️ Error al reproducir [%s]: %v. Saltando...\r\n", track.Title, err)
+
+		if !manager.Next(){
+			return nil, false
+		}
+		intentos++
+	}
+
+	return nil, false
+}
+
+func enrichMetadata(tracks []domain.Track){
+	for i := range tracks{
+		f, err := os.Open(tracks[i].Path)
+		if err != nil {
+			continue
+		}
+
+		m, err := tag.ReadFrom(f)
+		if err == nil{
+			artist	:= m.Artist()
+			title	:= m.Title()
+
+			if title != " "{
+				if artist != " "{
+					tracks[i].Title = fmt.Sprintf("%s - %s", artist, title)
+				} else {
+					tracks[i].Title = title
+				}
+			}
+		}
+		f.Close()
+	}
 }
