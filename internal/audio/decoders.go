@@ -56,3 +56,15 @@ func (w *flacDecoderWrapper) Read(p []byte) (int, error){
 	w.off += n
 	return n, nil
 }
+
+func (w *flacDecoderWrapper) SeekSamples(sampleNum uint64) error{
+	_, err := w.stream.Seek(sampleNum)
+	if err != nil {
+		return err
+	} 
+
+	// Vaciar el caché interno 
+	w.buf = nil
+	w.off = 0
+	return nil
+}

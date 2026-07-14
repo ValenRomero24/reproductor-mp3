@@ -26,6 +26,9 @@ type activeTrack struct {
 	sampleRate	int
 	isFading	bool			// Si está en fadeou, ignora su propio EOF
 	mu			sync.RWMutex	// Protege el estado de esta cancion.
+
+	// Callback dinámico para resolver el seek según las necesidades del formato
+	seekFunc	func(targetBytes int64, targetSamples uint64) error
 }
 
 type OtoEngine struct {
@@ -75,6 +78,10 @@ func (e *OtoEngine) createActiveTrack(path string) (*activeTrack, error){
 		fileSampleRate = dec.SampleRate()
 		pcmStream = dec
 		track.totalBytes = dec.Length()
+		track.seekFunc = func(targetBytes int64, targetSamples uint64) error{
+			_, err := dec.Seek(targetBytes, io.SeekStart)
+			return err
+		}
 	case ".WAV":
 		dec := wav.NewReader(file)
 		format, err := dec.Format()
@@ -88,18 +95,28 @@ func (e *OtoEngine) createActiveTrack(path string) (*activeTrack, error){
 		if err == nil {
 			track.totalBytes = info.Size() -44
 		}
+		headerOffset, _ := file.Seek(0, io.SeekCurrent)
+		track.seekFunc = func(targetBytes int64, targetSamples uint64) error {
+			_, err := file.Seek(headerOffset + targetBytes, io.SeekStart)
+			return err
+		}
 	case ".flac": 
-		dec, err := flac.New(file)
+		dec, err := flac.NewSeek(file)
 		if err != nil {
-			file.Close()
 			return nil, err
 		}
-		fileSampleRate = int(dec.Info.SampleRate)
-		pcmStream = &flacDecoderWrapper{
+
+		flacWrapper := &flacDecoderWrapper{
 			stream: dec,
 			bps:	int(dec.Info.BitsPerSample),
 		}
+		pcmStream = flacWrapper
 		track.totalBytes = int64(dec.Info.NSamples) * 2 * 2
+
+		track.seekFunc = func(targetBytes int64, targetSamples uint64) error {
+			return flacWrapper.SeekSamples(targetSamples)
+		}
+
 	default:
 		file.Close()
 		return nil, fmt.Errorf("formato no soportado: %s", ext)
@@ -147,12 +164,10 @@ func (e *OtoEngine) Play(path string) error {
 	e.mu.Lock()
 
 	if e.current != nil{
-		e.current.player.Close()
 		e.current.file.Close()
 		e.current = nil
 	}
 	if e.fading != nil {
-		e.fading.player.Close()
 		e.fading.file.Close()
 		e.fading = nil
 	}
@@ -233,7 +248,6 @@ func (e *OtoEngine) CrossFadeTo(path string) error{
 			new.mu.Unlock()
 		}
 
-		old.player.Close()
 		old.file.Close()
 
 		e.mu.Lock()
@@ -319,4 +333,41 @@ func (e *OtoEngine) GetProgress() (time.Duration, time.Duration){
 
 	return time.Duration((float64(br) / float64(bps)) * float64(time.Second)),
 	       time.Duration((float64(tb) / float64(bps)) * float64(time.Second))
+}
+
+
+// Adelanta o retrocede la reproducción por una duración dada
+func (e *OtoEngine) Seek(target time.Duration) error {
+	e.mu.Lock()
+	curr := e.current
+	e.mu.Unlock()
+
+	if curr == nil {
+		return fmt.Errorf("no hay ninguna canción en reproducción activa")
+	}
+	curr.mu.Lock()
+	defer curr.mu.Unlock()
+
+	if curr.seekFunc == nil {
+		return fmt.Errorf("el formato actual no soporta operaciones de búsqueda")
+	}
+
+	targetSamples	:= uint64(target.Seconds() * float64(curr.sampleRate))
+	targetBytes 	:= int64(targetSamples * 4)
+
+	if targetBytes < 0 {
+		targetBytes = 0
+		targetSamples = 0
+	}
+	if targetBytes > curr.totalBytes {
+		targetBytes = curr.totalBytes
+		targetSamples = uint64(curr.totalBytes / 4)
+	}
+
+	if err := curr.seekFunc(targetBytes, targetSamples); err != nil {
+		return fmt.Errorf("error al reposicionar el decoder: %v", err)
+	}
+
+	curr.bytesRead = targetBytes
+	return nil
 }

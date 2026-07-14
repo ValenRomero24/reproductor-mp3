@@ -115,6 +115,12 @@ func main() {
 				} else {
 					running = false
 				}
+			case 'b', 'B':
+				pos, _ := engine.GetProgress()
+				_ = engine.Seek(pos - (5 * time.Second))
+			case 'f', 'F':
+				pos, _ := engine.GetProgress()
+				_ = engine.Seek(pos + (5 * time.Second))
 			case 's', 'S':
 				manager.ToggleShuffle()
 			case 'l', 'L':
