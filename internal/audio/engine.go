@@ -82,7 +82,7 @@ func (e *OtoEngine) createActiveTrack(path string) (*activeTrack, error){
 			_, err := dec.Seek(targetBytes, io.SeekStart)
 			return err
 		}
-	case ".WAV":
+	case ".wav":
 		dec := wav.NewReader(file)
 		format, err := dec.Format()
 		if err != nil {
@@ -101,22 +101,24 @@ func (e *OtoEngine) createActiveTrack(path string) (*activeTrack, error){
 			return err
 		}
 	case ".flac": 
-		dec, err := flac.NewSeek(file)
+		dec, err := flac.New(file)
 		if err != nil {
 			return nil, err
 		}
 
 		flacWrapper := &flacDecoderWrapper{
+			file:	file,
 			stream: dec,
 			bps:	int(dec.Info.BitsPerSample),
 		}
 		pcmStream = flacWrapper
 		track.totalBytes = int64(dec.Info.NSamples) * 2 * 2
+		fileSampleRate = int(dec.Info.SampleRate)
 
 		track.seekFunc = func(targetBytes int64, targetSamples uint64) error {
-			return flacWrapper.SeekSamples(targetSamples)
+			originalSamples := uint64(float64(targetSamples) * (float64(fileSampleRate) / 44100.0))
+			return flacWrapper.SeekSamples(originalSamples)
 		}
-
 	default:
 		file.Close()
 		return nil, fmt.Errorf("formato no soportado: %s", ext)
@@ -142,7 +144,7 @@ func (e *OtoEngine) createActiveTrack(path string) (*activeTrack, error){
 
 	if e.context == nil {
 		options := &oto.NewContextOptions{
-			SampleRate:		44100,
+			SampleRate:		fileSampleRate,
 			ChannelCount:	2,
 			Format:			oto.FormatSignedInt16LE,
 		}
@@ -350,6 +352,11 @@ func (e *OtoEngine) Seek(target time.Duration) error {
 
 	if curr.seekFunc == nil {
 		return fmt.Errorf("el formato actual no soporta operaciones de búsqueda")
+	}
+
+	targetSecs := target.Seconds()
+	if targetSecs < 0 {
+		targetSecs = 0
 	}
 
 	targetSamples	:= uint64(target.Seconds() * float64(curr.sampleRate))

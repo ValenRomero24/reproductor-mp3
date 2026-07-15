@@ -1,12 +1,15 @@
 package audio
 
 import (
+	"fmt"
 	"io"
+	"os"
 	"github.com/mewkiz/flac"
 )
 
 // flacDecoderWrapper: Transforma frame de FLAC en un flujo io.Reader PCM
 type flacDecoderWrapper struct{
+	file	*os.File
 	stream	*flac.Stream
 	buf		[]byte
 	off		int
@@ -57,14 +60,45 @@ func (w *flacDecoderWrapper) Read(p []byte) (int, error){
 	return n, nil
 }
 
-func (w *flacDecoderWrapper) SeekSamples(sampleNum uint64) error{
-	_, err := w.stream.Seek(sampleNum)
+func (w *flacDecoderWrapper) SeekSamples(targetSamples uint64) error{
+	if _, err := w.file.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+
+	newStream, err := flac.New(w.file)
 	if err != nil {
 		return err
-	} 
+	}
+	w.stream	= newStream
+	w.buf 		= nil
+	w.off 		= 0
 
-	// Vaciar el caché interno 
+	var currentSample uint64 = 0
+	for currentSample < targetSamples {
+		frame, err := w.stream.ParseNext()
+		if err != nil {
+			if err == io.EOF { break }
+			return err
+		}
+		currentSample += uint64(len(frame.Subframes[0].Samples))
+	}
+	return nil
+}
+
+func (w *flacDecoderWrapper) Seek(offset int64, whence int) (int64, error) {
+	if whence != io.SeekStart {
+		return 0, fmt.Errorf("solo se soporta SeekStart para búsquedas en FLAC")
+	}
+
+	targetSample := uint64(offset / 4)
+
+	_, err := w.stream.Seek(targetSample)
+	if err != nil {
+		return 0, fmt.Errorf("error buscando muestra en FLAC: %v", err)
+	}
+
 	w.buf = nil
 	w.off = 0
-	return nil
+	return offset, nil
+
 }
